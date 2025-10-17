@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  redpanda-parquet-collector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: redpanda-parquet-collector
+    restart: unless-stopped
+    
+    # Mount the output directory to the host
+    volumes:
+      - /data:/app/data
+    
+    # Environment variables
+    environment:
+      # Redpanda connection (update this to match your Redpanda instance)
+      - BOOTSTRAP_SERVERS=192.168.1.110:19092
+      
+      # Output directory (mapped to /data on host via volume mount)
+      - OUTPUT_DIR=/app/data/redpanda_parquet
+      
+      # Processing configuration
+      - MAX_MESSAGES=
+      - BATCH_SIZE=100000
+      - MAX_WORKERS=4
+      - SKIP_EXISTING_CHECK=true
+    
+    # Network configuration
+    network_mode: "host"
+    
+    # Remove the healthcheck since the app doesn't expose an HTTP endpoint
+    healthcheck:
+      disable: true
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: If you want to run Redpanda locally in Docker as well
+# Uncomment the following sections:
+
+#  redpanda:
+#    image: docker.redpanda.com/redpandadata/redpanda:latest
+#    container_name: redpanda
+#    command:
+#      - redpanda
+#      - start
+#      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+#      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+#      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+#      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+#      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+#      - --rpc-addr redpanda:33145
+#      - --advertise-rpc-addr redpanda:33145
+#      - --mode dev-container
+#      - --smp 1
+#      - --default-log-level=info
+#    ports:
+#      - 18081:18081
+#      - 18082:18082
+#      - 19092:19092
+#      - 19644:9644
+#    volumes:
+#      - redpanda-data:/var/lib/redpanda/data
+#    healthcheck:
+#      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+#      interval: 15s
+#      timeout: 3s
+#      retries: 5
+#      start_period: 5s
+#
+#volumes:
+#  redpanda-data:
+

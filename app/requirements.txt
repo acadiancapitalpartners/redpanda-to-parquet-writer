@@ -1,0 +1,6 @@
+confluent-kafka
+msgpack
+lz4
+pydantic
+polars
+rich
