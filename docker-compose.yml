@@ -6,19 +6,19 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     container_name: redpanda-parquet-collector
-    restart: unless-stopped
+    restart: no  # Container exits after single run
     
     # Mount the output directory to the host
     volumes:
-      - /data:/app/data
+      - /data/datalake/redpanda_backup:/app/output
     
     # Environment variables
     environment:
       # Redpanda connection (update this to match your Redpanda instance)
       - BOOTSTRAP_SERVERS=192.168.1.110:19092
       
-      # Output directory (mapped to /data on host via volume mount)
-      - OUTPUT_DIR=/app/data/redpanda_parquet
+      # Output directory (mapped to /data/datalake/redpanda_backup on host)
+      - OUTPUT_DIR=/app/output
       
       # Processing configuration
       - MAX_MESSAGES=
