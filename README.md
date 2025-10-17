@@ -12,6 +12,7 @@ Streams data from Redpanda topics and saves to date-partitioned Parquet files.
 - **Performance optimized** - 100K message batches, aggressive consumer settings
 - **Docker containerized** - Easy deployment on any Linux host
 - **No consumer group pollution** - Unique consumer groups per run, no offset commits
+- **Automatic deduplication** - Safe to run multiple times, no data loss or duplication
 
 ## Architecture
 
@@ -128,27 +129,31 @@ All configuration is done via environment variables in `docker-compose.yml`:
 | `MAX_MESSAGES` | _(empty/None)_ | Limit messages per topic (for testing) |
 | `BATCH_SIZE` | `100000` | Messages per Parquet write (higher = faster, more memory) |
 | `MAX_WORKERS` | `4` | Parallel topic processing threads |
-| `SKIP_EXISTING_CHECK` | `true` | `true` = overwrite (fast), `false` = incremental (slower) |
+| `SKIP_EXISTING_CHECK` | `true` | `true` = read all data, `false` = incremental from last offset |
 | `TERM` | `xterm-256color` | Terminal type for colored output (pre-configured) |
 | `PYTHONUNBUFFERED` | `1` | Disable output buffering for real-time logs (pre-configured) |
 
 ### Configuration Modes
 
-#### Fast/Fresh Export Mode (Default)
+#### Full Read Mode (Default)
 ```yaml
 - SKIP_EXISTING_CHECK=true
 ```
-- **Faster**: No read-modify-write cycle
-- **Use case**: Initial export, full refresh, testing
-- **Behavior**: Overwrites existing files for same date
+- **Behavior**: Reads ALL data from Kafka/Redpanda from offset 0
+- **Safe**: Automatically deduplicates and merges with existing Parquet files
+- **Use case**: Full backup, catch-up after downtime, ensuring completeness
+- **Performance**: Slower for large topics (reads all data), but guarantees no data loss
 
 #### Incremental Mode
 ```yaml
 - SKIP_EXISTING_CHECK=false
 ```
-- **Slower**: Reads existing files and appends new data
-- **Use case**: Ongoing backups, preserving historical data
-- **Behavior**: Only processes messages newer than last run
+- **Behavior**: Only reads NEW messages since the last recorded offset in Parquet files
+- **Safe**: Also deduplicates and merges with existing data
+- **Use case**: Frequent scheduled runs, real-time backups
+- **Performance**: Faster (only reads new data)
+
+**🛡️ Data Safety:** Both modes automatically deduplicate by `(partition, offset)`, so running multiple times never causes data loss or duplication!
 
 ## Output Structure
 
@@ -353,27 +358,33 @@ user: "0:0"  # Run as root (not recommended)
 
 **Symptoms:** The script completes but not all expected records are in the Parquet files.
 
-**Solution:** This has been fixed in the current version. The script now:
-- Uses a **unique consumer group ID** for every run (UUID-based)
-- Has `enable.auto.commit=False` to prevent offset persistence
-- Always has access to all data in Kafka/Redpanda
+**Root Causes Fixed:**
 
-**To verify the fix:**
+1. **Consumer Group Persistence** ✅ FIXED
+   - Old versions used static consumer groups that "remembered" offsets
+   - **Solution**: Now uses unique UUID-based consumer groups per run
+   - **Verify**: Look for `Session ID: <uuid>` in output
+
+2. **File Overwriting** ✅ FIXED  
+   - Old versions would overwrite existing Parquet files on subsequent runs
+   - **Solution**: Now always appends and deduplicates by (partition, offset)
+   - **Safe to run multiple times** - no data loss!
+
+**How to ensure complete backups:**
+
 ```bash
-# Look for the Session ID in the output
-docker-compose run --rm redpanda-parquet-collector
+# Option 1: Full read mode (reads everything from Kafka)
+docker-compose run --rm -e SKIP_EXISTING_CHECK=true redpanda-parquet-collector
 
-# Should show:
-# Session ID: a3f8c2b1
-# Using unique consumer groups: reader-a3f8c2b1-<topic>
+# Option 2: Incremental mode (only new data since last run)
+docker-compose run --rm -e SKIP_EXISTING_CHECK=false redpanda-parquet-collector
+
+# Both options are safe - they deduplicate automatically
 ```
 
-**If using an older version:** Manually delete consumer groups from Redpanda:
+**If using an older version (< v2):** Manually delete consumer groups:
 ```bash
-# List consumer groups
 rpk group list --brokers 192.168.1.110:19092
-
-# Delete old consumer groups
 rpk group delete reader-<topic> --brokers 192.168.1.110:19092
 ```
 

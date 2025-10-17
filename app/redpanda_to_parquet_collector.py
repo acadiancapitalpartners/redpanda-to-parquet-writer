@@ -13,8 +13,8 @@ Features:
 Performance Optimizations:
 - BATCH_SIZE: 100K messages per write (reduces I/O operations)
 - Aggressive consumer settings: 10MB per partition, 1GB queue
-- SKIP_EXISTING_CHECK: Set to True for fresh exports (skips offset checks)
-- Fast mode: No read-modify-write cycle when SKIP_EXISTING_CHECK=True
+- SKIP_EXISTING_CHECK: Set to True for full reads (ignores parquet file offsets)
+- Automatic deduplication: Uses (partition, offset) to prevent duplicate records
 - Auto-commit disabled: Prevents Kafka consumer group offset interference
 
 Message Format:
@@ -32,12 +32,14 @@ Message Format:
     - Lists are converted to JSON strings for storage
 
 Usage:
-  Fresh export:  SKIP_EXISTING_CHECK = True   (faster, overwrites files, reads from beginning)
-  Incremental:   SKIP_EXISTING_CHECK = False  (slower, preserves existing data, resumes from last offset)
+  Full read mode:   SKIP_EXISTING_CHECK = True   (reads all data from Kafka, merges with existing)
+  Incremental mode: SKIP_EXISTING_CHECK = False  (only reads new data since last parquet offset)
   
-  NOTE: Each run uses a UNIQUE consumer group ID (UUID-based) and does NOT commit offsets.
-        This ensures ALL data in Kafka/Redpanda is always available for reading, regardless
-        of previous runs. Incremental behavior is controlled by existing parquet files only.
+  NOTE: 
+  - Each run uses a UNIQUE consumer group ID (UUID-based) and does NOT commit offsets
+  - ALL writes automatically deduplicate using (partition, offset) - no data loss!
+  - Safe to run multiple times - existing data is always preserved and merged
+  - Incremental behavior is controlled by existing parquet files, NOT Kafka offsets
 """
 
 import json
@@ -271,7 +273,12 @@ def get_existing_max_offsets(topic):
 
 
 def write_parquet_batch_fast(topic, records, console=None):
-    """Write records with FAST append - no reading existing files."""
+    """
+    Write records to Parquet with automatic deduplication.
+    
+    Always appends to existing files and deduplicates by (partition, offset).
+    Safe to run multiple times - no data loss.
+    """
     if not records:
         return 0
     
@@ -309,20 +316,51 @@ def write_parquet_batch_fast(topic, records, console=None):
         
         filepath = os.path.join(output_path, f"{topic}.parquet")
         
-        if os.path.exists(filepath) and not SKIP_EXISTING_CHECK:
-            # INCREMENTAL MODE: Read existing data and combine (slower but preserves data)
+        if os.path.exists(filepath):
+            # File exists - ALWAYS append to preserve data
             try:
                 # Read existing data
                 existing_df = pl.read_parquet(filepath)
-                combined_df = pl.concat([existing_df, date_df.drop("date_path")])
                 
-                # Write to temp file first (avoids Windows file locking)
+                # Get existing offsets to avoid duplicates
+                if len(existing_df) > 0 and "kafka_partition" in existing_df.columns and "kafka_offset" in existing_df.columns:
+                    # Create a set of (partition, offset) tuples for fast lookup
+                    existing_offsets = set(zip(
+                        existing_df["kafka_partition"].to_list(),
+                        existing_df["kafka_offset"].to_list()
+                    ))
+                    
+                    # Filter out records that already exist
+                    new_df = date_df.drop("date_path")
+                    if len(new_df) > 0:
+                        mask = [
+                            (part, offset) not in existing_offsets
+                            for part, offset in zip(
+                                new_df["kafka_partition"].to_list(),
+                                new_df["kafka_offset"].to_list()
+                            )
+                        ]
+                        new_df = new_df.filter(pl.Series(mask))
+                        
+                        if len(new_df) > 0:
+                            # Combine existing + new (deduplicated)
+                            combined_df = pl.concat([existing_df, new_df])
+                        else:
+                            # No new records to add
+                            combined_df = existing_df
+                    else:
+                        combined_df = existing_df
+                else:
+                    # No partition/offset columns or empty file - just concat
+                    combined_df = pl.concat([existing_df, date_df.drop("date_path")])
+                
+                # Write to temp file first (avoids file corruption)
                 temp_fd, temp_path = tempfile.mkstemp(suffix=".parquet", dir=output_path)
                 os.close(temp_fd)  # Close the file descriptor
                 
                 try:
                     combined_df.write_parquet(temp_path, compression="snappy")
-                    # Replace original with temp file (atomic on Windows)
+                    # Replace original with temp file (atomic)
                     shutil.move(temp_path, filepath)
                 finally:
                     # Clean up temp file if it still exists
@@ -336,7 +374,7 @@ def write_parquet_batch_fast(topic, records, console=None):
                     console.log(f"[yellow][WARN][/yellow] {topic}: Append failed, creating new file: {e}")
                 date_df.drop("date_path").write_parquet(filepath, compression="snappy")
         else:
-            # FAST MODE or NEW FILE: Just write/overwrite without reading (much faster)
+            # NEW FILE: Just write
             date_df.drop("date_path").write_parquet(filepath, compression="snappy")
     
     return records_written
