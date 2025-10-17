@@ -11,15 +11,27 @@ Streams data from Redpanda topics and saves to date-partitioned Parquet files.
 - **Date-partitioned output** - Organized by `YYYY/MM/DD/topic.parquet`
 - **Performance optimized** - 100K message batches, aggressive consumer settings
 - **Docker containerized** - Easy deployment on any Linux host
+- **No consumer group pollution** - Unique consumer groups per run, no offset commits
 
 ## Architecture
 
 ```
 Redpanda Topics → Python Consumer → Polars DataFrame → Parquet Files
-                                                            ↓
-                                              /data/datalake/redpanda_backup/
+                  (unique UUID)                            ↓
+                  (no offset commit)         /data/datalake/redpanda_backup/
                                                     2025/10/17/topic1.parquet
 ```
+
+### Consumer Behavior
+
+**Important:** This application is designed to always have access to ALL data in your Redpanda topics:
+
+- ✅ **Unique consumer group per run** - Each execution generates a UUID-based consumer group ID
+- ✅ **No offset commits** - `enable.auto.commit=False` ensures offsets are never saved to Kafka/Redpanda
+- ✅ **Full data availability** - All messages remain available for reading on every run
+- ✅ **Incremental via Parquet files** - Progress tracking is done by reading existing Parquet files, NOT Kafka offsets
+
+**Why this matters:** Without unique consumer groups, Kafka/Redpanda would "remember" where you left off, preventing you from re-reading historical data or getting complete exports.
 
 ## Quick Start
 
@@ -71,13 +83,14 @@ docker-compose down
 
 ### Option 2: Run with docker-compose run
 
-For more control over individual runs:
+For more control over individual runs (includes interactive progress bars):
 
 ```bash
 # Build first
 docker-compose build
 
 # Run once (auto-removes container after exit)
+# You'll see live progress bars and colored output
 docker-compose run --rm redpanda-parquet-collector
 
 # Run with custom environment variables
@@ -86,6 +99,8 @@ docker-compose run --rm \
   -e BATCH_SIZE=50000 \
   redpanda-parquet-collector
 ```
+
+**Note:** Progress bars and colored output work best with `docker-compose run` as it allocates a TTY by default.
 
 ### Option 3: Continuous/Daemon Mode
 
@@ -114,6 +129,8 @@ All configuration is done via environment variables in `docker-compose.yml`:
 | `BATCH_SIZE` | `100000` | Messages per Parquet write (higher = faster, more memory) |
 | `MAX_WORKERS` | `4` | Parallel topic processing threads |
 | `SKIP_EXISTING_CHECK` | `true` | `true` = overwrite (fast), `false` = incremental (slower) |
+| `TERM` | `xterm-256color` | Terminal type for colored output (pre-configured) |
+| `PYTHONUNBUFFERED` | `1` | Disable output buffering for real-time logs (pre-configured) |
 
 ### Configuration Modes
 
@@ -260,15 +277,52 @@ Columns in Parquet:
 
 ## Monitoring
 
+### Visual Output & Progress Bars
+
+The application uses the **Rich** library to provide beautiful terminal output including:
+
+- 🎨 **Colored output** - Green for success, red for errors, yellow for warnings
+- 📊 **Live progress bars** - Per-topic and overall progress
+- ⚡ **Real-time throughput** - Messages per second for each topic
+- 📈 **Completion percentages** - Track progress across all topics
+
+**Example Output:**
+```
+Session ID: a3f8c2b1
+Using unique consumer groups: reader-a3f8c2b1-<topic>
+
+Found 5 topics: market_data, trades, quotes, orders, positions
+
+⠹ Overall Progress ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3/5  60%  0:00:45
+  ✓ market_data - 1,245,678 msgs (25,000 msg/s)
+  ✓ trades - 892,345 msgs (18,000 msg/s)
+  ⠹ quotes - 12,450 msg/s ━━━━━━━━━━━━━━━━━━━━━ 450K/1.2M  37%
+  ⠹ orders - 8,200 msg/s ━━━━━━━━━━━━━━━━ 123K/890K  14%
+  ⏸ positions - initializing...
+```
+
 ### View Live Progress
 
 ```bash
-# If running in foreground
+# Best: Interactive mode with full rich output
+docker-compose run --rm redpanda-parquet-collector
+
+# Also shows progress bars (foreground)
 docker-compose up
 
-# If running in background
-docker-compose logs -f
+# Limited: Background mode (progress bars don't update smoothly)
+docker-compose up -d
+docker-compose logs -f  # Shows text output but not interactive progress
 ```
+
+### Terminal Requirements
+
+For the best visual experience:
+- ✅ Use `docker-compose run` or `docker-compose up` (foreground)
+- ✅ Terminal with 256-color support (most modern terminals)
+- ✅ Terminal width of at least 80 characters
+- ❌ Don't use `docker-compose run -T` (disables TTY)
+- ❌ Background mode (`-d`) won't show live progress bars
 
 ### Check Output Files
 
@@ -293,6 +347,34 @@ sudo chown -R 1000:1000 /data/datalake/redpanda_backup
 
 # Or run with different user (add to docker-compose.yml)
 user: "0:0"  # Run as root (not recommended)
+```
+
+### Not Reading All Records / Missing Data
+
+**Symptoms:** The script completes but not all expected records are in the Parquet files.
+
+**Solution:** This has been fixed in the current version. The script now:
+- Uses a **unique consumer group ID** for every run (UUID-based)
+- Has `enable.auto.commit=False` to prevent offset persistence
+- Always has access to all data in Kafka/Redpanda
+
+**To verify the fix:**
+```bash
+# Look for the Session ID in the output
+docker-compose run --rm redpanda-parquet-collector
+
+# Should show:
+# Session ID: a3f8c2b1
+# Using unique consumer groups: reader-a3f8c2b1-<topic>
+```
+
+**If using an older version:** Manually delete consumer groups from Redpanda:
+```bash
+# List consumer groups
+rpk group list --brokers 192.168.1.110:19092
+
+# Delete old consumer groups
+rpk group delete reader-<topic> --brokers 192.168.1.110:19092
 ```
 
 ### Can't Connect to Redpanda
@@ -342,6 +424,40 @@ docker-compose logs
 # Or run interactively
 docker-compose run --rm redpanda-parquet-collector bash
 ```
+
+### Progress Bars Not Showing / Garbled Output
+
+**Symptoms:** Progress bars appear as text characters, colors missing, or output is garbled.
+
+**Solutions:**
+
+1. **Ensure TTY is allocated:**
+   ```bash
+   # Good (allocates TTY)
+   docker-compose run --rm redpanda-parquet-collector
+   
+   # Bad (no TTY)
+   docker-compose run --rm -T redpanda-parquet-collector
+   ```
+
+2. **Check terminal capabilities:**
+   ```bash
+   # Test your terminal supports colors
+   echo $TERM  # Should show something like "xterm-256color"
+   ```
+
+3. **Force color output (if needed):**
+   The `TERM=xterm-256color` and `PYTHONUNBUFFERED=1` environment variables are already set in docker-compose.yml.
+
+4. **Verify Rich library is working:**
+   ```bash
+   # Test Rich inside container
+   docker-compose run --rm redpanda-parquet-collector \
+     python -c "from rich.console import Console; Console().print('[bold green]Success![/bold green]')"
+   ```
+
+5. **For automation/cron jobs without TTY:**
+   The script will automatically fall back to simpler text output when no TTY is available.
 
 ## Development
 

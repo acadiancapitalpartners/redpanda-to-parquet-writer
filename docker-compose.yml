@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     container_name: redpanda-parquet-collector
-    restart: no  # Container exits after single run
+    restart: "no"  # Container exits after single run
     
     # Mount the output directory to the host
     volumes:
@@ -25,6 +25,10 @@ services:
       - BATCH_SIZE=100000
       - MAX_WORKERS=4
       - SKIP_EXISTING_CHECK=true
+      
+      # Terminal/Rich library settings (for proper progress bar rendering)
+      - TERM=xterm-256color
+      - PYTHONUNBUFFERED=1
     
     # Network configuration
     network_mode: "host"

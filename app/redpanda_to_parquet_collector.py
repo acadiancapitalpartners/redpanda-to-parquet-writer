@@ -15,6 +15,7 @@ Performance Optimizations:
 - Aggressive consumer settings: 10MB per partition, 1GB queue
 - SKIP_EXISTING_CHECK: Set to True for fresh exports (skips offset checks)
 - Fast mode: No read-modify-write cycle when SKIP_EXISTING_CHECK=True
+- Auto-commit disabled: Prevents Kafka consumer group offset interference
 
 Message Format:
   Expected MessagePack structure:
@@ -31,8 +32,12 @@ Message Format:
     - Lists are converted to JSON strings for storage
 
 Usage:
-  Fresh export:  SKIP_EXISTING_CHECK = True   (faster, overwrites files)
-  Incremental:   SKIP_EXISTING_CHECK = False  (slower, preserves existing data)
+  Fresh export:  SKIP_EXISTING_CHECK = True   (faster, overwrites files, reads from beginning)
+  Incremental:   SKIP_EXISTING_CHECK = False  (slower, preserves existing data, resumes from last offset)
+  
+  NOTE: Each run uses a UNIQUE consumer group ID (UUID-based) and does NOT commit offsets.
+        This ensures ALL data in Kafka/Redpanda is always available for reading, regardless
+        of previous runs. Incremental behavior is controlled by existing parquet files only.
 """
 
 import json
@@ -40,6 +45,7 @@ import os
 import tempfile
 import shutil
 import time
+import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import polars as pl
@@ -56,6 +62,10 @@ MAX_MESSAGES = int(os.getenv("MAX_MESSAGES")) if os.getenv("MAX_MESSAGES") else 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100000"))  # Write to parquet every 100K messages (increased for performance)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # Parallel topic processing
 SKIP_EXISTING_CHECK = os.getenv("SKIP_EXISTING_CHECK", "true").lower() in ("true", "1", "yes")  # Set to True for fresh exports (faster, skips reading existing files)
+
+# Generate unique session ID for this run to avoid consumer group offset conflicts
+# Each run gets its own consumer group, ensuring all data is read regardless of previous runs
+SESSION_ID = str(uuid.uuid4())[:8]
 
 
 def flatten_dict(d, parent_key='', sep='_'):
@@ -104,8 +114,9 @@ def get_topic_high_watermarks(topic):
     """Get high watermark offsets for all partitions to calculate total messages."""
     consumer = Consumer({
         "bootstrap.servers": BOOTSTRAP_SERVERS,
-        "group.id": f"watermark-reader-{topic}",
+        "group.id": f"watermark-reader-{SESSION_ID}-{topic}",
         "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,  # Don't commit offsets (read-only operation)
     })
     
     try:
@@ -126,9 +137,10 @@ def consume_topic_streaming(topic, start_offsets=None):
     """Stream messages from specified offsets (generator)."""
     consumer = Consumer({
         "bootstrap.servers": BOOTSTRAP_SERVERS,
-        "group.id": f"reader-{topic}",
+        "group.id": f"reader-{SESSION_ID}-{topic}",
         "auto.offset.reset": "earliest",
         "enable.partition.eof": True,
+        "enable.auto.commit": False,  # CRITICAL: Don't commit offsets - ensures all data is read every time
         # Aggressive performance tuning for fast exports
         "fetch.min.bytes": 1024 * 1024,  # 1MB min fetch (increased from 100KB)
         "fetch.wait.max.ms": 100,  # Shorter wait (faster response)
@@ -403,8 +415,11 @@ def process_topic(topic, progress=None, task_id=None, console=None):
 
 def main():
     console = Console()
+    console.print(f"\n[bold cyan]Session ID:[/bold cyan] {SESSION_ID}")
+    console.print(f"[dim]Using unique consumer groups: reader-{SESSION_ID}-<topic>[/dim]\n")
+    
     topics = get_all_topics()
-    console.print(f"\n[bold cyan]Found {len(topics)} topics:[/bold cyan] {', '.join(topics)}\n")
+    console.print(f"[bold cyan]Found {len(topics)} topics:[/bold cyan] {', '.join(topics)}\n")
     
     # Create Rich Progress display
     with Progress(
