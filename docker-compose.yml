@@ -8,9 +8,10 @@ services:
     container_name: redpanda-parquet-collector
     restart: "no"  # Container exits after single run
     
-    # Mount the output directory to the host
+    # Mount the output directory and logs directory to the host
     volumes:
       - /data/datalake/redpanda_backup:/app/output
+      - /logs:/app/logs
     
     # Environment variables
     environment:
@@ -20,11 +21,25 @@ services:
       # Output directory (mapped to /data/datalake/redpanda_backup on host)
       - OUTPUT_DIR=/app/output
       
+      # Log directory (mapped to /logs on host)
+      - LOG_DIR=/app/logs
+      
       # Processing configuration
       - MAX_MESSAGES=
-      - BATCH_SIZE=100000
+      - BATCH_SIZE=1000000      # 1M messages per batch (optimized for one-time exports)
       - MAX_WORKERS=4
       - SKIP_EXISTING_CHECK=true
+      - SKIP_DEDUPLICATION=true # Skip deduplication for massive speedup on one-time exports
+      - SKIP_VALIDATION=false  # Set to true to skip post-run validation
+      
+      # Advanced Performance Configuration
+      - PARQUET_COMPRESSION=zstd      # snappy, zstd, gzip
+      - COMPRESSION_LEVEL=3            # 1-22 for zstd
+      - ROW_GROUP_SIZE=1000000         # Rows per parquet row group
+      - FETCH_MIN_BYTES=10485760       # 10MB
+      - MAX_PARTITION_FETCH_BYTES=52428800  # 50MB
+      - PROGRESS_UPDATE_INTERVAL=250000  # Update progress every 250K msgs
+      - MEMORY_BATCH_SIZE=1000000       # Convert to DF every 1M messages
       
       # Terminal/Rich library settings (for proper progress bar rendering)
       - TERM=xterm-256color
@@ -36,6 +51,41 @@ services:
     # Remove the healthcheck since the app doesn't expose an HTTP endpoint
     healthcheck:
       disable: true
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Parquet Reader Service - Analyze parquet files created by the collector
+  parquet-reader:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: parquet-reader
+    restart: "no"
+    
+    # Mount the output directory to read parquet files
+    volumes:
+      - /data/datalake/redpanda_backup:/app/output
+    
+    # Environment variables
+    environment:
+      - OUTPUT_DIR=/app/output
+      - TERM=xterm-256color
+      - PYTHONUNBUFFERED=1
+    
+    # Network configuration
+    network_mode: "host"
+    
+    # Override the default CMD to run the reader instead
+    command: python parquet_to_polars.py
+    
+    # Optional: only start when explicitly requested
+    profiles:
+      - tools
     
     # Logging configuration
     logging:
