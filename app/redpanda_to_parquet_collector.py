@@ -1148,7 +1148,7 @@ def validate_topic(topic, script_reported_count, console=None):
                     if os.path.exists(parquet_file):
                         try:
                             df = pl.read_parquet(parquet_file, columns=["kafka_partition"])
-                            part_counts = df.group_by("kafka_partition").agg(pl.count())
+                            part_counts = df.group_by("kafka_partition").agg(pl.len())
                             for row in part_counts.iter_rows(named=True):
                                 partition = row["kafka_partition"]
                                 count = row["count"]
