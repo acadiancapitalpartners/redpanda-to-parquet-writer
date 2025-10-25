@@ -44,14 +44,14 @@ Redpanda Topics → Python Consumer → Polars DataFrame → Parquet Files
 
 - Docker and Docker Compose installed
 - Redpanda instance accessible from the host
-- Write permissions to `/data/datalake/redpanda_backup/` directory
+- Write permissions to `/data/redpanda_backup/` directory
 
 ### Setup
 
 1. **Create output directory on Linux host:**
    ```bash
-   sudo mkdir -p /data/datalake/redpanda_backup
-   sudo chown -R 1000:1000 /data/datalake/redpanda_backup  # Match container user
+   sudo mkdir -p /data/redpanda_backup
+   sudo chown -R 1000:1000 /data/redpanda_backup  # Match container user
    ```
 
 2. **Clone or copy this repository**
@@ -198,7 +198,7 @@ All configuration is done via environment variables in `docker-compose.yml`:
 Files are organized by date in a hierarchical structure:
 
 ```
-/data/datalake/redpanda_backup/
+/data/redpanda_backup/
 ├── 2025/
 │   ├── 10/
 │   │   ├── 16/
@@ -399,13 +399,13 @@ For the best visual experience:
 
 ```bash
 # List generated files
-ls -lR /data/datalake/redpanda_backup/
+ls -lR /data/redpanda_backup/
 
 # Check file size
-du -sh /data/datalake/redpanda_backup/*
+du -sh /data/redpanda_backup/*
 
 # Count messages in a file (requires DuckDB or Polars)
-python -c "import polars as pl; print(len(pl.read_parquet('/data/datalake/redpanda_backup/2025/10/17/market_data.parquet')))"
+python -c "import polars as pl; print(len(pl.read_parquet('/data/redpanda_backup/2025/10/17/market_data.parquet')))"
 ```
 
 ### Post-Run Validation
@@ -535,7 +535,7 @@ If you need to validate files outside of the automatic process:
 
 ```bash
 # Count records in all parquet files for a topic
-find /data/datalake/redpanda_backup -name "market_data.parquet" -exec \
+find /data/redpanda_backup -name "market_data.parquet" -exec \
   python -c "import polars as pl; import sys; print(len(pl.read_parquet(sys.argv[1])))" {} \; | \
   awk '{sum+=$1} END {print "Total records:", sum}'
 
@@ -549,7 +549,7 @@ rpk topic describe market_data --brokers 192.168.1.110:19092
 
 ```bash
 # Fix permissions
-sudo chown -R 1000:1000 /data/datalake/redpanda_backup
+sudo chown -R 1000:1000 /data/redpanda_backup
 
 # Or run with different user (add to docker-compose.yml)
 user: "0:0"  # Run as root (not recommended)
@@ -682,6 +682,41 @@ docker-compose run --rm redpanda-parquet-collector bash
 
 ## Development
 
+### Development Mode (Live Code Changes)
+
+The Docker setup now includes development mode with live code mounting:
+
+**Key Features:**
+- ✅ **Live code changes** - Python code changes take effect immediately on next run
+- ✅ **No rebuild required** - Skip `docker-compose build` for code changes
+- ✅ **Fast iteration** - Edit code and test instantly
+
+**What requires rebuild:**
+- Changes to `requirements.txt` (new dependencies)
+- Changes to `Dockerfile` (system packages, Python version, etc.)
+
+**Development Workflow:**
+```bash
+# 1. Initial setup (only needed once)
+docker-compose build
+
+# 2. Make code changes in app/ directory
+# Edit app/redpanda_to_parquet_collector.py
+# Edit app/parquet_to_polars.py
+
+# 3. Test changes immediately (no rebuild!)
+docker-compose run --rm redpanda-parquet-collector
+
+# 4. Only rebuild when dependencies change
+# Edit app/requirements.txt
+docker-compose build
+```
+
+**Volume Mounts:**
+- `./app:/app` - Live code mounting
+- `/data/redpanda_backup:/app/output` - Output directory
+- `/logs:/app/logs` - Log directory
+
 ### Local Testing (Without Docker)
 
 ```bash
@@ -748,6 +783,34 @@ docker-compose run --rm parquet-reader python parquet_to_polars.py today
 
 # Or without Docker
 python app/parquet_to_polars.py today
+```
+
+### Command-Line Arguments
+
+The reader script accepts several command-line arguments:
+
+- `--base-dir, -b PATH` - Specify base directory for parquet files
+  - Default: `./data/redpanda_parquet` (or `OUTPUT_DIR` environment variable)
+  - Docker default: `/app/output`
+  - Example: `python parquet_to_polars.py -b C:\DATA\my_parquet_files`
+
+- `--deduplicate, -d` - Deduplicate parquet files based on content hash
+  - Example: `python parquet_to_polars.py --deduplicate`
+
+- `date` - Filter by specific date in YYYY/MM/DD format
+  - Special value: `today` for current date
+  - Example: `python parquet_to_polars.py 2025/10/14`
+
+**Combined examples:**
+```bash
+# Read from custom directory
+python app/parquet_to_polars.py --base-dir C:\CODE\redpanda_data
+
+# Read specific date from custom directory
+python app/parquet_to_polars.py -b /mnt/data/parquet 2025/10/14
+
+# Deduplicate files in custom directory
+python app/parquet_to_polars.py -b C:\DATA -d today
 ```
 
 ## Dependencies

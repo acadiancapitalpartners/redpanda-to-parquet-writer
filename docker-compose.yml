@@ -8,10 +8,11 @@ services:
     container_name: redpanda-parquet-collector
     restart: "no"  # Container exits after single run
     
-    # Mount the output directory and logs directory to the host
+    # Mount the output directory, logs directory, and app code to the host
     volumes:
-      - /data/datalake/redpanda_backup:/app/output
+      - /data/redpanda_backup:/app/output
       - /logs:/app/logs
+      - ./app:/app
     
     # Environment variables
     environment:
@@ -67,9 +68,10 @@ services:
     container_name: parquet-reader
     restart: "no"
     
-    # Mount the output directory to read parquet files
+    # Mount the output directory and app code to read parquet files
     volumes:
-      - /data/datalake/redpanda_backup:/app/output
+      - /data/redpanda_backup:/app/output
+      - ./app:/app
     
     # Environment variables
     environment:

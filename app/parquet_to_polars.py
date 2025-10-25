@@ -593,6 +593,231 @@ class ParquetReader:
         
         return sorted([f.stem for f in parquet_files])
     
+    def generate_content_hash(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Generate content hash for each record, excluding Kafka metadata fields.
+        
+        Args:
+            df: Input DataFrame
+            
+        Returns:
+            DataFrame with added _content_hash column
+        """
+        # Get all columns except those starting with 'kafka_'
+        content_columns = [col for col in df.columns if not col.startswith("kafka_")]
+        
+        if not content_columns:
+            # If no content columns, use all columns
+            content_columns = df.columns
+        
+        # Create hash from content columns
+        df_with_hash = df.with_columns([
+            pl.struct(content_columns).hash().alias("_content_hash")
+        ])
+        
+        return df_with_hash
+    
+    def create_backup(self, filepath: Path) -> Path:
+        """
+        Create a backup of the original file with timestamp.
+        
+        Args:
+            filepath: Path to the file to backup
+            
+        Returns:
+            Path to the backup file
+        """
+        # Create backup directory with timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        backup_dir = self.parquet_dir / ".backups" / timestamp
+        
+        # Calculate relative path from parquet_dir
+        try:
+            relative_path = filepath.relative_to(self.parquet_dir)
+        except ValueError:
+            # If not relative to parquet_dir, use filename only
+            relative_path = Path(filepath.name)
+        
+        # Create backup filepath preserving directory structure
+        backup_filepath = backup_dir / relative_path
+        
+        # Create backup directory structure
+        backup_filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Copy file to backup location
+        import shutil
+        shutil.copy2(filepath, backup_filepath)
+        
+        return backup_filepath
+    
+    def deduplicate_file(self, filepath: Path) -> Dict[str, Any]:
+        """
+        Deduplicate a single parquet file based on content hash.
+        
+        Args:
+            filepath: Path to the parquet file to deduplicate
+            
+        Returns:
+            Dictionary with deduplication statistics
+        """
+        try:
+            # Load the parquet file
+            df = self.load_parquet(filepath)
+            original_count = len(df)
+            
+            if original_count == 0:
+                return {
+                    "filepath": str(filepath),
+                    "original_count": 0,
+                    "deduplicated_count": 0,
+                    "duplicates_removed": 0,
+                    "status": "skipped",
+                    "error": None
+                }
+            
+            # Generate content hash
+            df_with_hash = self.generate_content_hash(df)
+            
+            # Deduplicate by content hash, keep first occurrence
+            deduplicated_df = df_with_hash.unique(subset=["_content_hash"], keep="first")
+            
+            # Remove hash column before writing
+            deduplicated_df = deduplicated_df.drop("_content_hash")
+            
+            deduplicated_count = len(deduplicated_df)
+            duplicates_removed = original_count - deduplicated_count
+            
+            # Write deduplicated data back to file
+            deduplicated_df.write_parquet(filepath)
+            
+            return {
+                "filepath": str(filepath),
+                "original_count": original_count,
+                "deduplicated_count": deduplicated_count,
+                "duplicates_removed": duplicates_removed,
+                "status": "success",
+                "error": None
+            }
+            
+        except Exception as e:
+            return {
+                "filepath": str(filepath),
+                "original_count": 0,
+                "deduplicated_count": 0,
+                "duplicates_removed": 0,
+                "status": "error",
+                "error": str(e)
+            }
+    
+    def deduplicate_all_files(self, date_filter: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Deduplicate all parquet files, optionally filtered by date.
+        
+        Args:
+            date_filter: Optional date filter in format 'YYYY/MM/DD' to only process specific date
+            
+        Returns:
+            Dictionary with deduplication summary statistics
+        """
+        if not self.parquet_dir.exists():
+            console.print(f"[ERROR] Directory not found: {self.parquet_dir}", style="red")
+            return {"status": "error", "error": f"Directory not found: {self.parquet_dir}"}
+        
+        # Search for parquet files (handles date-partitioned structure)
+        if date_filter:
+            search_path = self.parquet_dir / date_filter
+            if not search_path.exists():
+                console.print(f"[ERROR] Date directory not found: {search_path}", style="red")
+                return {"status": "error", "error": f"Date directory not found: {search_path}"}
+            parquet_files = list(search_path.glob("*.parquet"))
+        else:
+            parquet_files = list(self.parquet_dir.rglob("*.parquet"))
+        
+        # Exclude backup files and hidden files
+        parquet_files = [f for f in parquet_files if not f.name.startswith(".") and ".backups" not in str(f)]
+        
+        if not parquet_files:
+            search_loc = f"{self.parquet_dir}/{date_filter}" if date_filter else str(self.parquet_dir)
+            console.print(f"[ERROR] No parquet files found in {search_loc}", style="red")
+            return {"status": "error", "error": f"No parquet files found in {search_loc}"}
+        
+        console.print(f"\n[DEDUPLICATION] Found {len(parquet_files)} parquet file(s) to process\n", style="bold green")
+        
+        # Process each file
+        results = []
+        total_original = 0
+        total_deduplicated = 0
+        total_duplicates_removed = 0
+        successful_files = 0
+        error_files = 0
+        
+        for filepath in sorted(parquet_files):
+            try:
+                # Show relative path from parquet_dir
+                try:
+                    relative_path = filepath.relative_to(self.parquet_dir)
+                    console.print(f"Processing: {relative_path}", style="bold blue")
+                except ValueError:
+                    console.print(f"Processing: {filepath.name}", style="bold blue")
+                
+                # Create backup first
+                backup_path = self.create_backup(filepath)
+                console.print(f"[BACKUP] Created backup: {backup_path.relative_to(self.parquet_dir)}", style="dim")
+                
+                # Deduplicate the file
+                result = self.deduplicate_file(filepath)
+                results.append(result)
+                
+                # Update totals
+                if result["status"] == "success":
+                    total_original += result["original_count"]
+                    total_deduplicated += result["deduplicated_count"]
+                    total_duplicates_removed += result["duplicates_removed"]
+                    successful_files += 1
+                    
+                    console.print(f"[SUCCESS] {result['original_count']:,} → {result['deduplicated_count']:,} records ({result['duplicates_removed']:,} duplicates removed)", style="green")
+                elif result["status"] == "error":
+                    error_files += 1
+                    console.print(f"[ERROR] {result['error']}", style="red")
+                else:  # skipped
+                    console.print(f"[SKIPPED] Empty file", style="yellow")
+                
+                console.print()
+                
+            except Exception as e:
+                error_files += 1
+                console.print(f"[ERROR] Failed to process {filepath.name}: {e}", style="red")
+                console.print()
+                continue
+        
+        # Summary report
+        console.print("=" * 80, style="green")
+        console.print(f"[SUMMARY] Deduplication Complete", style="bold green")
+        console.print("=" * 80, style="green")
+        console.print(f"Files processed: {len(parquet_files)}", style="bold")
+        console.print(f"Successful: {successful_files}", style="green")
+        console.print(f"Errors: {error_files}", style="red" if error_files > 0 else "green")
+        console.print(f"Skipped: {len(parquet_files) - successful_files - error_files}", style="yellow")
+        console.print()
+        console.print(f"Total original records: {total_original:,}", style="bold")
+        console.print(f"Total deduplicated records: {total_deduplicated:,}", style="bold")
+        console.print(f"Total duplicates removed: {total_duplicates_removed:,}", style="bold")
+        
+        if total_original > 0:
+            dedup_percentage = (total_duplicates_removed / total_original) * 100
+            console.print(f"Deduplication rate: {dedup_percentage:.2f}%", style="cyan")
+        
+        return {
+            "status": "success",
+            "files_processed": len(parquet_files),
+            "successful_files": successful_files,
+            "error_files": error_files,
+            "total_original_records": total_original,
+            "total_deduplicated_records": total_deduplicated,
+            "total_duplicates_removed": total_duplicates_removed,
+            "results": results
+        }
+    
     def load_and_display_all(self, date_filter: Optional[str] = None):
         """Scan parquet directory and display all files (supports date-partitioned structure).
         
@@ -686,21 +911,52 @@ def main():
     console.print(Panel.fit(
         "Parquet to Polars Reader\n" +
         "Read and validate Redpanda topic data from parquet files\n" +
-        "Supports date-partitioned structure: ./redpanda_parquet/YYYY/MM/DD/",
+        "Supports date-partitioned structure: ./redpanda_parquet/YYYY/MM/DD/\n" +
+        "Includes deduplication functionality",
         style="bold magenta"
     ))
     console.print()
     
     # Parse command-line arguments
     date_filter = None
+    deduplicate_mode = False
+    base_dir = None
+    
+    # Check for base directory flag
+    if "--base-dir" in sys.argv:
+        idx = sys.argv.index("--base-dir")
+        if idx + 1 < len(sys.argv):
+            base_dir = sys.argv[idx + 1]
+            # Remove both flag and value from args
+            sys.argv = [arg for i, arg in enumerate(sys.argv) if i not in [idx, idx + 1]]
+    elif "-b" in sys.argv:
+        idx = sys.argv.index("-b")
+        if idx + 1 < len(sys.argv):
+            base_dir = sys.argv[idx + 1]
+            # Remove both flag and value from args
+            sys.argv = [arg for i, arg in enumerate(sys.argv) if i not in [idx, idx + 1]]
+    
+    # Check for deduplication flag
+    if "--deduplicate" in sys.argv or "-d" in sys.argv:
+        deduplicate_mode = True
+        # Remove the deduplication flag from args
+        sys.argv = [arg for arg in sys.argv if arg not in ["--deduplicate", "-d"]]
+    
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if arg in ["-h", "--help"]:
-            console.print("Usage: python parquet_to_polars_reader.py [date]", style="bold")
+            console.print("Usage: python parquet_to_polars.py [options] [date]", style="bold")
+            console.print("\nOptions:", style="cyan")
+            console.print("  --base-dir, -b PATH    Specify base directory for parquet files (default: ./data/redpanda_parquet or OUTPUT_DIR env var)")
+            console.print("  --deduplicate, -d      Deduplicate parquet files based on content hash")
             console.print("\nExamples:", style="cyan")
-            console.print("  python parquet_to_polars_reader.py              # Read all dates")
-            console.print("  python parquet_to_polars_reader.py 2025/10/14   # Read specific date")
-            console.print("  python parquet_to_polars_reader.py today        # Read today's date")
+            console.print("  python parquet_to_polars.py                    # Read all dates")
+            console.print("  python parquet_to_polars.py 2025/10/14         # Read specific date")
+            console.print("  python parquet_to_polars.py today              # Read today's date")
+            console.print("  python parquet_to_polars.py -b C:\DATA\my_parquet_files         # Custom base directory")
+            console.print("  python parquet_to_polars.py --base-dir /mnt/data/parquet today  # Custom directory with date filter")
+            console.print("  python parquet_to_polars.py --deduplicate       # Deduplicate all files")
+            console.print("  python parquet_to_polars.py -d 2025/10/14      # Deduplicate specific date")
             return
         elif arg == "today":
             date_filter = datetime.now().strftime("%Y/%m/%d")
@@ -709,14 +965,36 @@ def main():
             date_filter = arg
             console.print(f"[DATE] Filtering for date: {date_filter}\n", style="cyan")
     
-    # Create reader
-    reader = ParquetReader()
+    # Create reader with base directory
+    reader = ParquetReader(parquet_dir=base_dir)
     
-    # Load and display all parquet files
-    dataframes = reader.load_and_display_all(date_filter=date_filter)
-    
-    # Optional: Return dataframes for programmatic access
-    return dataframes
+    if deduplicate_mode:
+        # Deduplication mode
+        console.print(Panel.fit(
+            "DEDUPLICATION MODE\n" +
+            "Removing duplicate records based on content hash\n" +
+            "Original files will be backed up before modification",
+            style="bold yellow"
+        ))
+        console.print()
+        
+        # Run deduplication
+        result = reader.deduplicate_all_files(date_filter=date_filter)
+        
+        if result["status"] == "success":
+            console.print("\n[bold green]✓ Deduplication completed successfully![/bold green]")
+        else:
+            console.print(f"\n[bold red]✗ Deduplication failed: {result.get('error', 'Unknown error')}[/bold red]")
+            return None
+        
+        return result
+    else:
+        # Normal read mode
+        # Load and display all parquet files
+        dataframes = reader.load_and_display_all(date_filter=date_filter)
+        
+        # Optional: Return dataframes for programmatic access
+        return dataframes
 
 
 if __name__ == "__main__":

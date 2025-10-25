@@ -40,11 +40,14 @@ Message Format:
     - Lists are converted to JSON strings for storage
 
 Usage:
-  One-time export mode:   SKIP_DEDUPLICATION = True   (fastest, batched memory + parallel writes)
-  Incremental mode:       SKIP_DEDUPLICATION = False  (batched memory + deduplication)
+  Fast mode:              SKIP_DEDUPLICATION = True   (fast consumption + deferred deduplication)
+  Inline mode:            SKIP_DEDUPLICATION = False  (inline deduplication during write)
   
-  Full read mode:         SKIP_EXISTING_CHECK = True   (reads all data from Kafka, merges with existing)
-  Incremental mode:        SKIP_EXISTING_CHECK = False  (only reads new data since last parquet offset)
+  Memory optimized:       SKIP_EXISTING_CHECK = True   (skips preloading existing data for memory efficiency)
+  Full deduplication:     SKIP_EXISTING_CHECK = False  (preloads existing data for complete deduplication)
+  
+  Kafka cleanup:          KAFKA_CLEANUP_ENABLED = True (trims processed records from Kafka after successful write)
+  Staging retention:      STAGING_RETENTION_DAYS = 7 (days to keep staging files as safety net)
   
   NOTE: 
   - Each run uses a UNIQUE consumer group ID (UUID-based) and does NOT commit offsets
@@ -80,9 +83,15 @@ LOG_DIR = os.getenv("LOG_DIR", "/app/logs")  # Directory for log files
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES")) if os.getenv("MAX_MESSAGES") else None  # or set to an int limit per topic if needed
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000000"))  # Write to parquet every 1M messages (optimized for one-time exports)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # Parallel topic processing
-SKIP_EXISTING_CHECK = os.getenv("SKIP_EXISTING_CHECK", "true").lower() in ("true", "1", "yes")  # Set to True for fresh exports (faster, skips reading existing files)
-SKIP_DEDUPLICATION = os.getenv("SKIP_DEDUPLICATION", "true").lower() in ("true", "1", "yes")  # Set to True for one-time exports (skips deduplication for massive speedup)
+SKIP_EXISTING_CHECK = os.getenv("SKIP_EXISTING_CHECK", "true").lower() in ("true", "1", "yes")  # Controls memory optimization (whether to preload existing data for deduplication)
+SKIP_DEDUPLICATION = os.getenv("SKIP_DEDUPLICATION", "true").lower() in ("true", "1", "yes")  # Controls WHEN deduplication happens (inline vs deferred), not IF it happens
 SKIP_VALIDATION = os.getenv("SKIP_VALIDATION", "false").lower() in ("true", "1", "yes")  # Set to True to skip post-run validation
+
+# Kafka Cleanup Configuration
+KAFKA_CLEANUP_ENABLED = os.getenv("KAFKA_CLEANUP_ENABLED", "false").lower() in ("true", "1", "yes")
+KAFKA_CLEANUP_MODE = os.getenv("KAFKA_CLEANUP_MODE", "after_write")  # Options: "none", "after_write", "manual"
+KAFKA_CONTAINER_NAME = os.getenv("KAFKA_CONTAINER_NAME", "redpanda-1")
+STAGING_RETENTION_DAYS = int(os.getenv("STAGING_RETENTION_DAYS", "7"))  # Days to keep staging files as safety net
 
 # Advanced Performance Configuration
 PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "zstd")  # snappy, zstd, gzip
@@ -460,9 +469,9 @@ def get_existing_max_offsets(topic):
     """Get the maximum offset for each partition from existing parquet files - OPTIMIZED."""
     max_offsets = {}  # {partition: max_offset}
     
-    # If skipping existing checks, return empty (start from beginning)
-    if SKIP_EXISTING_CHECK:
-        return max_offsets
+    # ALWAYS check existing offsets to prevent duplicate processing
+    # SKIP_EXISTING_CHECK now only affects memory optimization (preloading existing data)
+    # but we still need to track offsets to avoid re-reading from Kafka
     
     # Check all date directories for this topic
     if not os.path.exists(OUTPUT_DIR):
@@ -624,18 +633,57 @@ def load_existing_data_for_topic(topic, start_offsets=None):
     return combined_df, total_count
 
 
-def write_date_partition(date_path, date_df, topic, existing_df, console=None):
+def write_date_partition(date_path, date_df, topic, existing_df, console=None, deferred_dedup=False):
     """
     Write a single date partition to parquet file.
     
     This function is designed to be called in parallel for different dates.
     Returns tuple: (records_written, filepath, file_size_bytes, compression_ratio)
+    
+    Args:
+        deferred_dedup: If True, write to staging directory and defer deduplication to merge phase
     """
     new_df = date_df.drop("date_path")
     
     # Create directory structure
     output_path = os.path.join(OUTPUT_DIR, date_path)
     os.makedirs(output_path, exist_ok=True)
+    
+    # NEW DEFERRED DEDUP PATH: Write to staging directory for later merge
+    if deferred_dedup:
+        # Create staging directory
+        staging_path = os.path.join(output_path, ".staging")
+        os.makedirs(staging_path, exist_ok=True)
+        
+        # Write to staging file with unique session ID
+        temp_filepath = os.path.join(staging_path, f"{topic}_{SESSION_ID}.parquet")
+        
+        # Estimate raw data size (rough approximation)
+        estimated_raw_size = len(new_df) * 200  # Assume ~200 bytes per record average
+        
+        try:
+            new_df.write_parquet(
+                temp_filepath, 
+                compression=PARQUET_COMPRESSION,
+                compression_level=COMPRESSION_LEVEL if PARQUET_COMPRESSION == "zstd" else None,
+                row_group_size=ROW_GROUP_SIZE
+            )
+            
+            # Get actual file size
+            file_size_bytes = os.path.getsize(temp_filepath)
+            compression_ratio = (1.0 - file_size_bytes / estimated_raw_size) * 100 if estimated_raw_size > 0 else 0.0
+            
+            # Log the staging write
+            if console:
+                size_mb = file_size_bytes / (1024 * 1024)
+                console.log(f"[blue][INFO][/blue] {topic}: Staged {temp_filepath} ({len(new_df):,} records, {size_mb:.1f} MB)")
+            
+            return len(new_df), temp_filepath, file_size_bytes, compression_ratio
+            
+        except Exception as e:
+            if console:
+                console.log(f"[red][ERROR][/red] {topic}: Failed to write staging file: {e}")
+            raise
     
     # Find compatible file or create new version
     filepath, schema_version, is_new_version = find_compatible_file(output_path, topic)
@@ -793,15 +841,18 @@ def write_date_partition(date_path, date_df, topic, existing_df, console=None):
         return len(new_df), filepath, file_size_bytes, compression_ratio
 
 
-def write_parquet_bulk_fast(topic, all_records_df, existing_df=None, console=None):
+def write_parquet_bulk_fast(topic, all_records_df, existing_df=None, console=None, deferred_dedup=False):
     """
     Write all records to parquet with parallel date partition writes.
     
     This is much more efficient than per-batch deduplication for large datasets.
-    Returns tuple: (total_records_written, list_of_file_info)
+    Returns tuple: (total_records_written, list_of_file_info, date_paths_written)
+    
+    Args:
+        deferred_dedup: If True, write to staging files and defer deduplication to merge phase
     """
     if len(all_records_df) == 0:
-        return 0, []
+        return 0, [], set()
     
     records_written = len(all_records_df)
     
@@ -831,7 +882,8 @@ def write_parquet_bulk_fast(topic, all_records_df, existing_df=None, console=Non
                     date_df, 
                     topic, 
                     existing_df,
-                    console
+                    console,
+                    deferred_dedup
                 )
                 write_futures.append(future)
             
@@ -857,12 +909,12 @@ def write_parquet_bulk_fast(topic, all_records_df, existing_df=None, console=Non
                     if console:
                         console.log(f"[red][ERROR][/red] {topic}: Write failed: {e}")
         
-        return total_written, file_info_list
+        return total_written, file_info_list, set(unique_dates)
     else:
         # Single date - use direct write
         date_path = unique_dates[0]
         date_df = all_records_df.filter(pl.col("date_path") == date_path)
-        result = write_date_partition(date_path, date_df, topic, existing_df, console)
+        result = write_date_partition(date_path, date_df, topic, existing_df, console, deferred_dedup)
         if isinstance(result, tuple) and len(result) == 4:
             records, filepath, size_bytes, compression_ratio = result
             return records, [{
@@ -870,10 +922,10 @@ def write_parquet_bulk_fast(topic, all_records_df, existing_df=None, console=Non
                 'records': records,
                 'size_bytes': size_bytes,
                 'compression_ratio': compression_ratio
-            }]
+            }], set(unique_dates)
         else:
             # Fallback for old return format
-            return result, []
+            return result, [], set(unique_dates)
 
 
 def write_parquet_batch_fast(topic, records, console=None):
@@ -883,11 +935,220 @@ def write_parquet_batch_fast(topic, records, console=None):
     For optimal performance, use write_parquet_bulk_fast() instead.
     """
     if not records:
-        return 0, []
+        return 0, [], set()
     
     # Convert to Polars DataFrame and use bulk function
     df = pl.DataFrame(records)
-    return write_parquet_bulk_fast(topic, df, existing_df=None, console=console)
+    total_written, file_info, date_paths = write_parquet_bulk_fast(topic, df, existing_df=None, console=console)
+    return total_written, file_info, date_paths
+
+
+def merge_staged_files(topic, console=None):
+    """
+    Merge staged temp files with existing parquet files using Polars deduplication.
+    
+    This is called after all consumption is complete for deferred deduplication.
+    Returns: (total_unique_records, list_of_final_files, date_paths_written)
+    """
+    if not os.path.exists(OUTPUT_DIR):
+        return 0, [], set()
+    
+    # Find all staging files for this topic
+    staging_files = []
+    for root, dirs, files in os.walk(OUTPUT_DIR):
+        staging_dir = os.path.join(root, ".staging")
+        if os.path.exists(staging_dir):
+            for f in os.listdir(staging_dir):
+                if f.startswith(f"{topic}_{SESSION_ID}"):
+                    staging_files.append(os.path.join(staging_dir, f))
+    
+    if not staging_files:
+        if console:
+            console.log(f"[blue][INFO][/blue] {topic}: No staging files found for merge")
+        return 0, [], set()
+    
+    if console:
+        console.log(f"[blue][INFO][/blue] {topic}: Merging {len(staging_files)} staging files...")
+    
+    try:
+        # Load all staged data
+        staged_dfs = []
+        total_staged_records = 0
+        for staging_file in staging_files:
+            try:
+                df = pl.read_parquet(staging_file)
+                staged_dfs.append(df)
+                total_staged_records += len(df)
+            except Exception as e:
+                if console:
+                    console.log(f"[yellow][WARN][/yellow] {topic}: Failed to read staging file {staging_file}: {e}")
+                continue
+        
+        if not staged_dfs:
+            if console:
+                console.log(f"[yellow][WARN][/yellow] {topic}: No valid staging files to merge")
+            return 0, [], set()
+        
+        staged_df = pl.concat(staged_dfs)
+        
+        if console:
+            console.log(f"[blue][INFO][/blue] {topic}: Loaded {total_staged_records:,} staged records")
+        
+        # Load existing parquet files for this topic
+        existing_df, existing_count = load_existing_data_for_topic(topic)
+        
+        if console and existing_count > 0:
+            console.log(f"[blue][INFO][/blue] {topic}: Found {existing_count:,} existing records")
+        
+        # Deduplicate using Polars anti-join
+        if existing_df is not None and len(existing_df) > 0:
+            # Use anti-join to exclude existing records
+            unique_df = staged_df.join(
+                existing_df.select(["kafka_partition", "kafka_offset"]),
+                on=["kafka_partition", "kafka_offset"],
+                how="anti"
+            )
+            
+            if console:
+                duplicates_removed = len(staged_df) - len(unique_df)
+                console.log(f"[blue][INFO][/blue] {topic}: Removed {duplicates_removed:,} duplicate records")
+        else:
+            unique_df = staged_df
+            if console:
+                console.log(f"[blue][INFO][/blue] {topic}: No existing data, keeping all {len(unique_df):,} records")
+        
+        # Write unique records back using existing bulk write logic
+        total_written, file_info, date_paths = write_parquet_bulk_fast(topic, unique_df, existing_df, console)
+        
+        # Clean up staging files (keep for 7 days as safety net)
+        for staging_file in staging_files:
+            try:
+                # Instead of deleting, rename with timestamp for 7-day retention
+                import time
+                timestamp = int(time.time())
+                retention_file = staging_file.replace(f"{topic}_{SESSION_ID}.parquet", f"{topic}_{SESSION_ID}_retained_{timestamp}.parquet")
+                os.rename(staging_file, retention_file)
+                
+                if console:
+                    console.log(f"[blue][INFO][/blue] {topic}: Retained staging file: {retention_file}")
+            except Exception as e:
+                if console:
+                    console.log(f"[yellow][WARN][/yellow] {topic}: Failed to retain staging file {staging_file}: {e}")
+        
+        if console:
+            console.log(f"[blue][INFO][/blue] {topic}: Merge complete - {total_written:,} unique records written")
+        
+        return total_written, file_info, date_paths
+        
+    except Exception as e:
+        if console:
+            console.log(f"[red][ERROR][/red] {topic}: Merge failed: {e}")
+        return 0, [], set()
+
+
+def cleanup_old_staging_files(console=None):
+    """
+    Remove staging files older than STAGING_RETENTION_DAYS to prevent disk space accumulation.
+    Default retention is 7 days, configurable via STAGING_RETENTION_DAYS environment variable.
+    """
+    if not os.path.exists(OUTPUT_DIR):
+        return
+    
+    import time
+    current_time = time.time()
+    retention_cutoff = current_time - (STAGING_RETENTION_DAYS * 24 * 60 * 60)  # Configurable retention period
+    
+    cleaned_count = 0
+    total_size_freed = 0
+    
+    # Walk through all staging directories
+    for root, dirs, files in os.walk(OUTPUT_DIR):
+        staging_dir = os.path.join(root, ".staging")
+        if os.path.exists(staging_dir):
+            for f in os.listdir(staging_dir):
+                if f.endswith("_retained_") and f.endswith(".parquet"):
+                    file_path = os.path.join(staging_dir, f)
+                    try:
+                        # Extract timestamp from filename
+                        # Format: topic_sessionID_retained_timestamp.parquet
+                        parts = f.split("_retained_")
+                        if len(parts) == 2:
+                            timestamp_str = parts[1].replace(".parquet", "")
+                            try:
+                                file_timestamp = int(timestamp_str)
+                                if file_timestamp < retention_cutoff:
+                                    file_size = os.path.getsize(file_path)
+                                    os.remove(file_path)
+                                    cleaned_count += 1
+                                    total_size_freed += file_size
+                                    if console:
+                                        console.log(f"[dim]Cleaned old staging file: {f}[/dim]")
+                            except ValueError:
+                                # Invalid timestamp format, skip
+                                pass
+                    except Exception as e:
+                        if console:
+                            console.log(f"[yellow][WARN][/yellow] Failed to clean staging file {f}: {e}")
+    
+    if cleaned_count > 0 and console:
+        size_mb = total_size_freed / (1024 * 1024)
+        console.log(f"[blue][INFO][/blue] Cleaned {cleaned_count} old staging files ({size_mb:.1f} MB freed)")
+
+
+def cleanup_kafka_topic(topic, max_offsets, console=None):
+    """
+    Trim Kafka topic to remove processed records using rpk.
+    
+    Args:
+        topic: Topic name
+        max_offsets: Dict of {partition: max_offset} to trim up to
+        console: Rich console for logging
+    """
+    if not KAFKA_CLEANUP_ENABLED or KAFKA_CLEANUP_MODE == "none":
+        return
+    
+    if not max_offsets:
+        if console:
+            console.log(f"[blue][INFO][/blue] {topic}: No offsets to trim (no data processed)")
+        return
+    
+    if console:
+        console.log(f"[blue][INFO][/blue] {topic}: Trimming Kafka topic up to processed offsets...")
+    
+    try:
+        import subprocess
+        
+        # For each partition, run rpk topic trim
+        for partition, max_offset in max_offsets.items():
+            if max_offset >= 0:  # Only trim if we have valid offsets
+                cmd = [
+                    "docker", "exec", "-i", KAFKA_CONTAINER_NAME,
+                    "rpk", "topic", "trim", topic,
+                    "--up-to-offset", str(max_offset),
+                    "--partitions", str(partition)
+                ]
+                
+                if console:
+                    console.log(f"[dim]Running: {' '.join(cmd)}[/dim]")
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    if console:
+                        console.log(f"[green][SUCCESS][/green] {topic}: Partition {partition} trimmed to offset {max_offset}")
+                else:
+                    if console:
+                        console.log(f"[yellow][WARN][/yellow] {topic}: Failed to trim partition {partition}: {result.stderr}")
+        
+        if console:
+            console.log(f"[green][SUCCESS][/green] {topic}: Kafka cleanup complete")
+            
+    except subprocess.TimeoutExpired:
+        if console:
+            console.log(f"[yellow][WARN][/yellow] {topic}: Kafka cleanup timed out")
+    except Exception as e:
+        if console:
+            console.log(f"[red][ERROR][/red] {topic}: Kafka cleanup failed: {e}")
 
 
 def load_existing_data_async(topic, start_offsets, executor):
@@ -927,7 +1188,7 @@ def process_topic(topic, progress=None, task_id=None, console=None):
             if progress and task_id is not None:
                 progress.update(task_id, description=f"[green]{topic}[/green] - up to date", completed=True)
             timing_tracker.end_phase(f"{topic}_total")
-            return topic, 0, None
+            return topic, 0, None, set()  # No date paths written
         
         if console:
             console.log(f"[blue][INFO][/blue] {topic}: Offset calculation complete ({offset_time:.1f}s)")
@@ -1048,7 +1309,17 @@ def process_topic(topic, progress=None, task_id=None, console=None):
                     console.log(f"[blue][INFO][/blue] {topic}: Writing to parquet files...")
                 
                 # SINGLE BULK WRITE with deduplication
-                total_written, file_info_list = write_parquet_bulk_fast(topic, all_records_df, existing_df, console)
+                if SKIP_DEDUPLICATION:
+                    # Two-phase: Fast write to staging, defer merge
+                    total_written, file_info_list, date_paths_written = write_parquet_bulk_fast(
+                        topic, all_records_df, existing_df=None, console=console, deferred_dedup=True
+                    )
+                    # Actual deduplication happens in merge phase (not here)
+                else:
+                    # Original path: inline deduplication
+                    total_written, file_info_list, date_paths_written = write_parquet_bulk_fast(
+                        topic, all_records_df, existing_df, console
+                    )
                 
                 write_time = timing_tracker.end_phase(f"{topic}_parquet_writing")
                 write_throughput = total_written / write_time if write_time > 0 else 0
@@ -1057,9 +1328,11 @@ def process_topic(topic, progress=None, task_id=None, console=None):
             else:
                 total_written = 0
                 file_info_list = []
+                date_paths_written = set()
         else:
             total_written = 0
             file_info_list = []
+            date_paths_written = set()
         
         # Mark as complete
         if progress and task_id is not None:
@@ -1076,7 +1349,7 @@ def process_topic(topic, progress=None, task_id=None, console=None):
         if console:
             console.log(f"[blue][INFO][/blue] {topic}: Processing complete ({total_time:.1f}s total)")
         
-        return topic, total_written, None
+        return topic, total_written, None, date_paths_written
         
     except Exception as e:
         if console:
@@ -1084,11 +1357,11 @@ def process_topic(topic, progress=None, task_id=None, console=None):
         if progress and task_id is not None:
             progress.update(task_id, description=f"[red]{topic}[/red] - ERROR")
         timing_tracker.end_phase(f"{topic}_total")
-        return topic, 0, str(e)
+        return topic, 0, str(e), set()
 
 
-def count_parquet_records(topic):
-    """Count total records for a topic across all date-partitioned parquet files."""
+def count_parquet_records(topic, date_paths_filter=None):
+    """Count total records for a topic across specified date-partitioned parquet files."""
     total_count = 0
     
     if not os.path.exists(OUTPUT_DIR):
@@ -1098,6 +1371,19 @@ def count_parquet_records(topic):
     for root, dirs, files in os.walk(OUTPUT_DIR):
         parquet_file = os.path.join(root, f"{topic}.parquet")
         if os.path.exists(parquet_file):
+            # If date_paths_filter is provided, only count files in those specific date paths
+            if date_paths_filter is not None:
+                # Extract date path from the file's directory structure
+                # root is like: ./data/redpanda_parquet/2024/10/25
+                # We need to extract the date part relative to OUTPUT_DIR
+                try:
+                    rel_path = os.path.relpath(root, OUTPUT_DIR)
+                    if rel_path not in date_paths_filter:
+                        continue
+                except ValueError:
+                    # If we can't get relative path, skip this file
+                    continue
+            
             try:
                 # Read only to count rows
                 df = pl.read_parquet(parquet_file)
@@ -1109,7 +1395,7 @@ def count_parquet_records(topic):
     return total_count
 
 
-def validate_topic(topic, script_reported_count, console=None):
+def validate_topic(topic, script_reported_count, date_paths_filter=None, console=None):
     """
     Validate a topic's parquet files against script reports and Kafka watermarks.
     
@@ -1117,6 +1403,7 @@ def validate_topic(topic, script_reported_count, console=None):
     - topic, script_reported, parquet_actual, kafka_expected
     - internal_match, external_match, status
     - partition_details (if mismatches found)
+    - date_paths_validated (which date ranges were checked)
     """
     result = {
         "topic": topic,
@@ -1126,12 +1413,22 @@ def validate_topic(topic, script_reported_count, console=None):
         "internal_match": False,
         "external_match": False,
         "status": "PASS",
-        "partition_details": {}
+        "partition_details": {},
+        "date_paths_validated": date_paths_filter or set()
     }
     
     try:
+        # Skip validation if no new data was written
+        if script_reported_count == 0:
+            result["status"] = "SKIPPED"
+            result["parquet_actual"] = 0
+            result["kafka_expected"] = 0
+            result["internal_match"] = True
+            result["external_match"] = True
+            return result
+        
         # Count actual records in parquet files
-        result["parquet_actual"] = count_parquet_records(topic)
+        result["parquet_actual"] = count_parquet_records(topic, date_paths_filter)
         
         # Get Kafka high watermarks
         try:
@@ -1146,6 +1443,15 @@ def validate_topic(topic, script_reported_count, console=None):
                 for root, dirs, files in os.walk(OUTPUT_DIR):
                     parquet_file = os.path.join(root, f"{topic}.parquet")
                     if os.path.exists(parquet_file):
+                        # If date_paths_filter is provided, only count files in those specific date paths
+                        if date_paths_filter is not None:
+                            try:
+                                rel_path = os.path.relpath(root, OUTPUT_DIR)
+                                if rel_path not in date_paths_filter:
+                                    continue
+                            except ValueError:
+                                continue
+                        
                         try:
                             df = pl.read_parquet(parquet_file, columns=["kafka_partition"])
                             part_counts = df.group_by("kafka_partition").agg(pl.len())
@@ -1215,25 +1521,33 @@ def run_validation(results, console):
         return
     
     validation_results = []
-    for topic, script_count, _ in successful:
-        validation_results.append(validate_topic(topic, script_count, console))
+    for topic, script_count, _, date_paths in successful:
+        validation_results.append(validate_topic(topic, script_count, date_paths, console))
     
     # Summary
     passed = [v for v in validation_results if v["status"] == "PASS"]
+    skipped = [v for v in validation_results if v["status"] == "SKIPPED"]
     warned = [v for v in validation_results if v["status"] == "WARNING"]
     errored = [v for v in validation_results if v["status"] == "ERROR"]
     
     if passed:
         console.print(f"[bold green]VALIDATION PASSED[/bold green] - {len(passed)} topics:")
         for v in passed:
-            console.print(f"  ✓ {v['topic']}: [green]{v['parquet_actual']:,}[/green] records verified")
+            date_info = f" (date ranges: {', '.join(sorted(v['date_paths_validated']))})" if v['date_paths_validated'] else ""
+            console.print(f"  ✓ {v['topic']}: [green]{v['parquet_actual']:,}[/green] records verified{date_info}")
+    
+    if skipped:
+        console.print(f"\n[bold blue]VALIDATION SKIPPED[/bold blue] - {len(skipped)} topics (no new data written):")
+        for v in skipped:
+            console.print(f"  ⏭ {v['topic']}: No new records to validate")
     
     if warned:
         console.print(f"\n[bold yellow]VALIDATION WARNINGS[/bold yellow] - {len(warned)} topics:")
         for v in warned:
             internal_msg = "✓" if v["internal_match"] else "✗"
             external_msg = "✓" if v["external_match"] else "✗" if v["external_match"] is not None else "?"
-            console.print(f"  ⚠ {v['topic']}: Internal {internal_msg} | External {external_msg}")
+            date_info = f" (date ranges: {', '.join(sorted(v['date_paths_validated']))})" if v['date_paths_validated'] else ""
+            console.print(f"  ⚠ {v['topic']}: Internal {internal_msg} | External {external_msg}{date_info}")
             
             # Detailed breakdown
             console.print(f"    Script reported: {v['script_reported']:,} records written")
@@ -1258,7 +1572,7 @@ def run_validation(results, console):
     
     # Overall summary
     console.print(f"\n[bold]Validation Summary:[/bold]")
-    console.print(f"  PASS: [green]{len(passed)}[/green] | WARNING: [yellow]{len(warned)}[/yellow] | ERROR: [red]{len(errored)}[/red]")
+    console.print(f"  PASS: [green]{len(passed)}[/green] | SKIPPED: [blue]{len(skipped)}[/blue] | WARNING: [yellow]{len(warned)}[/yellow] | ERROR: [red]{len(errored)}[/red]")
     
     if warned or errored:
         console.print("\n[yellow]⚠ Validation completed with warnings. Check logs above for details.[/yellow]")
@@ -1283,6 +1597,9 @@ def main():
     console.print(f"\n[bold cyan]Session ID:[/bold cyan] {SESSION_ID}")
     console.print(f"[dim]Using unique consumer groups: reader-{SESSION_ID}-<topic>[/dim]")
     console.print(f"[dim]Log file: {log_filepath}[/dim]\n")
+    
+    # Clean up old staging files (7-day retention)
+    cleanup_old_staging_files(console)
     
     # Start overall timing
     timing_tracker.start_time = time.perf_counter()
@@ -1335,6 +1652,25 @@ def main():
                     results.append((topic, 0, str(e)))
                     progress.update(overall_task, advance=1)
     
+    # Phase 2: Merge staged files with deduplication (if using deferred deduplication)
+    if SKIP_DEDUPLICATION:
+        console.print("\n[bold cyan]Merging staged files with deduplication...[/bold cyan]")
+        
+        # Track final deduplicated counts
+        final_results = []
+        total_final_records = 0
+        
+        for topic, raw_count, error, _ in results:
+            if error is None:  # Only merge successful topics
+                merge_count, merge_files, merge_date_paths = merge_staged_files(topic, console)
+                final_results.append((topic, merge_count, None, merge_date_paths))
+                total_final_records += merge_count
+            else:
+                final_results.append((topic, 0, error, set()))
+        
+        # Update results with final deduplicated counts
+        results = final_results
+    
     # Enhanced Summary
     console.print("\n" + "="*60)
     console.print("[bold cyan]SUMMARY: Processing Complete[/bold cyan]")
@@ -1350,7 +1686,7 @@ def main():
     
     if successful:
         console.print(f"\n[bold green]SUCCESS[/bold green] - Processed {len(successful)} topics:")
-        for topic, count, _ in successful:
+        for topic, count, _, _ in successful:
             # Get topic-specific timing
             topic_total_time = timing_tracker.phases.get(f"{topic}_total", 0)
             topic_throughput = count / topic_total_time if topic_total_time > 0 else 0
@@ -1366,7 +1702,7 @@ def main():
     
     if failed:
         console.print(f"\n[bold red]FAILED[/bold red] - {len(failed)} topics:")
-        for topic, count, error in failed:
+        for topic, count, error, _ in failed:
             console.print(f"  • {topic}: [red]{error}[/red]")
     
     # File summary
@@ -1418,6 +1754,26 @@ def main():
     # Run post-processing validation
     if not SKIP_VALIDATION:
         run_validation(results, console)
+    
+    # Phase 3: Kafka cleanup (if enabled)
+    if KAFKA_CLEANUP_ENABLED and KAFKA_CLEANUP_MODE == "after_write":
+        console.print("\n" + "="*60)
+        console.print("[bold cyan]KAFKA CLEANUP[/bold cyan]")
+        console.print("="*60)
+        console.print("[dim]Trimming processed records from Kafka topics...[/dim]\n")
+        
+        cleanup_count = 0
+        for topic, count, error, _ in results:
+            if error is None and count > 0:  # Only cleanup successful topics with data
+                # Get the max offsets that were processed for this topic
+                existing_max_offsets = get_existing_max_offsets(topic)
+                cleanup_kafka_topic(topic, existing_max_offsets, console)
+                cleanup_count += 1
+        
+        if cleanup_count > 0:
+            console.print(f"\n[bold green]Kafka cleanup completed for {cleanup_count} topics[/bold green]")
+        else:
+            console.print("\n[dim]No topics required Kafka cleanup[/dim]")
     
     # End overall timing
     timing_tracker.end_time = time.perf_counter()
